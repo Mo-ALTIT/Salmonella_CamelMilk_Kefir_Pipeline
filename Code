@@ -1,0 +1,1174 @@
+"""
+================================================================================
+PREDICTIVE MICROBIOLOGY — SALMONELLA INACTIVATION IN CAMEL MILK KEFIR
+Complete Analytical Pipeline —
+================================================================================
+Models   : Bigelow · Weibull · Global Bigelow · Global Weibull
+ML       : Random Forest · XGBoost · SVR
+Analysis : Secondary RSM · Feature Importance · SHAP · 
+Outputs  : All inline (no files saved)
+================================================================================
+"""
+
+# ==============================================================================
+# 0 — ENVIRONMENT SETUP
+# ==============================================================================
+import subprocess, sys
+
+def _pip(pkg):
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'])
+
+for _p in ['xgboost', 'shap', 'openpyxl']:
+    try:
+        __import__(_p)
+    except ImportError:
+        print(f'Installing {_p}...'); _pip(_p)
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+    print('[SETUP] Google Drive mounted.')
+except ImportError:
+    print('[SETUP] Not running in Colab — Drive mount skipped.')
+
+DATA_PATH     = '/content/drive/MyDrive/SALMONELLA INACTIVATION DATA/kefir_salmonella_data.xlsx'
+
+# ==============================================================================
+# 1 — IMPORTS
+# ==============================================================================
+import warnings, itertools
+warnings.filterwarnings('ignore')
+
+import numpy  as np
+import pandas as pd
+import matplotlib.pyplot  as plt
+import matplotlib.lines   as mlines
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+from scipy.optimize  import curve_fit
+from sklearn.ensemble              import RandomForestRegressor
+from sklearn.svm                   import SVR
+from sklearn.preprocessing         import StandardScaler
+from sklearn.pipeline              import Pipeline
+from sklearn.model_selection       import (GroupShuffleSplit, GroupKFold,
+                                           RandomizedSearchCV)
+from sklearn.metrics               import r2_score
+from sklearn.inspection            import permutation_importance
+import statsmodels.api as sm
+import xgboost as xgb
+import shap
+
+from IPython.display import display
+
+# ==============================================================================
+# 2 — GLOBAL CONSTANTS
+# ==============================================================================
+SEED        = 42
+APZ_UPPER   = +0.5
+APZ_LOWER   = -1.0
+P_THRESH    = 0.05
+
+RUN_COL     = 'Run_ID'
+TIME_COL    = 'Time '
+TARGET_COL  = 'LogN_Salmonella'
+SEC_FACTORS = ['Kefir_Grains', 'Fermentation_Time', 'Storage_Temperature ']   # 3 factors for secondary/global
+ML_FEATURES = ['Kefir_Grains', 'Fermentation_Time', 'Storage_Temperature ',
+               'Time ', 'pH', 'Titratable_Acidity ']                           # 6 features for ML
+
+# Minimalist publication plot style
+STYLE = {
+    'font.family': 'serif', 'font.serif': ['Times New Roman', 'DejaVu Serif'],
+    'axes.facecolor': 'white', 'figure.facecolor': 'white',
+    'axes.labelsize': 12,  'axes.titlesize': 13,
+    'axes.edgecolor': 'black', 'axes.linewidth': 0.9,
+    'xtick.labelsize': 10, 'ytick.labelsize': 10,
+    'xtick.direction': 'in', 'ytick.direction': 'in',
+    'xtick.top': True, 'ytick.right': True,
+    'legend.fontsize': 9,  'legend.frameon': False,
+    'figure.dpi': 110,
+}
+
+# ==============================================================================
+# 3 — LOAD DATA
+# ==============================================================================
+print('='*70)
+print('LOADING DATA')
+print('='*70)
+
+df = pd.read_excel(DATA_PATH)
+print(f'[OK] Main dataset     : {df.shape[0]} rows × {df.shape[1]} cols')
+print(f'     Columns : {df.columns.tolist()}')
+
+
+# Basic cleaning
+df = (df.drop_duplicates()
+        .dropna(how='all')
+        .dropna(subset=[RUN_COL, TIME_COL, TARGET_COL])
+        .reset_index(drop=True))
+
+# Per-run logN0 (max observed log10 count in each run)
+logN0_map   = df.groupby(RUN_COL)[TARGET_COL].max().to_dict()
+df['logN0'] = df[RUN_COL].map(logN0_map)
+
+# Forward/back-fill environmental columns within run
+all_env = ['Kefir_Grains', 'Fermentation_Time', 'Storage_Temperature ',
+           'pH', 'Titratable_Acidity ']
+df[all_env] = df.groupby(RUN_COL)[all_env].transform(
+    lambda x: x.ffill().bfill())
+
+print(f'\n[CLEAN] {df.shape[0]} rows | {df[RUN_COL].nunique()} Run_IDs')
+display(df.describe().round(3))
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — UTILITY FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+
+def calc_metrics(y_true, y_pred, k):
+    """RSS · RMSE · R² · AIC · Bf · Af.  k = number of free model parameters."""
+    yt = np.asarray(y_true, float);  yp = np.asarray(y_pred, float)
+    n   = len(yt);   res = yp - yt
+    rss = float(np.sum(res**2))
+    return {
+        'RSS' : rss,
+        'RMSE': float(np.sqrt(rss / n)),
+        'R2'  : float(r2_score(yt, yp)),
+        'AIC' : float(n * np.log(rss / n + 1e-15) + 2 * k),
+        'Bf'  : float(10.0 ** np.mean(res)),
+        'Af'  : float(10.0 ** np.mean(np.abs(res))),
+    }
+
+
+def calc_apz(y_obs, y_pred):
+    """% predictions inside Acceptable Prediction Zone (pred−obs convention)."""
+    r      = np.asarray(y_pred, float) - np.asarray(y_obs, float)
+    inside = np.sum((r >= APZ_LOWER) & (r <= APZ_UPPER))
+    p      = 100.0 * inside / len(y_obs)
+    return round(p, 2)
+
+
+def parity_plot(ax, y_obs, y_pred, title, k=6,
+                extra_obs=None, extra_pred=None, extra_label='External'):
+    """Parity plot with APZ band.  Optional overlay of external validation points."""
+    y_obs  = np.asarray(y_obs,  float)
+    y_pred = np.asarray(y_pred, float)
+    all_v  = [y_obs, y_pred]
+    if extra_obs  is not None: all_v.append(np.asarray(extra_obs,  float))
+    if extra_pred is not None: all_v.append(np.asarray(extra_pred, float))
+    lo = np.floor(np.concatenate(all_v).min()) - 0.3
+    hi = np.ceil (np.concatenate(all_v).max()) + 0.3
+    lr = np.array([lo, hi])
+
+    ax.scatter(y_obs, y_pred, color='black', s=20, alpha=0.65, zorder=5,
+               label='Training/Test')
+    if extra_obs is not None:
+        ax.scatter(extra_obs, extra_pred, color='red', s=45, marker='^',
+                   zorder=6, label=extra_label)
+    ax.plot(lr, lr,            'k-',  lw=1.2, label='y=x')
+    ax.plot(lr, lr + APZ_UPPER,'k--', lw=0.9, label=f'+{APZ_UPPER}')
+    ax.plot(lr, lr + APZ_LOWER,'k:',  lw=0.9, label=f'{APZ_LOWER}')
+    ax.fill_between(lr, lr+APZ_LOWER, lr+APZ_UPPER, color='grey', alpha=0.10)
+
+    m = calc_metrics(y_obs, y_pred, k);  a = calc_apz(y_obs, y_pred)
+    ax.text(0.04, 0.97,
+            f"R²={m['R2']:.3f}\nRMSE={m['RMSE']:.3f}\nAPZ={a:.1f}%",
+            transform=ax.transAxes, fontsize=8, va='top',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='grey', lw=0.4))
+    ax.set_xlabel(r'Observed $\log_{10}$ $N$ (CFU mL$^{-1}$)')
+    ax.set_ylabel(r'Predicted $\log_{10}$ $N$ (CFU mL$^{-1}$)')
+    ax.set_title(title, fontsize=10)
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.legend(loc='lower right', fontsize=7)
+
+
+def residual_plot(ax, y_obs, y_pred, title):
+    """Residual (obs−pred) vs predicted."""
+    res = np.asarray(y_obs, float) - np.asarray(y_pred, float)
+    ax.scatter(y_pred, res, color='black', s=18, alpha=0.65, zorder=5)
+    ax.axhline(0,         color='black', lw=1.2)
+    ax.axhline(APZ_UPPER, color='black', ls='--', lw=0.9, label=f'+{APZ_UPPER}')
+    ax.axhline(APZ_LOWER, color='black', ls=':',  lw=0.9, label=f'{APZ_LOWER}')
+    ax.fill_between(ax.get_xlim(), APZ_LOWER, APZ_UPPER,
+                    color='grey', alpha=0.10)
+    ax.set_xlabel(r'Predicted $\log_{10}$ $N$')
+    ax.set_ylabel('Residual (Obs − Pred)')
+    ax.set_title(title, fontsize=10);  ax.legend(fontsize=7)
+
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — CORRELATION ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 2 — CORRELATION ANALYSIS')
+print('='*70)
+
+CORR_VARS = ['Kefir_Grains','Fermentation_Time','Storage_Temperature ',
+             'Time ','pH','Titratable_Acidity ','LogN_Salmonella']
+
+corr_matrix = df[CORR_VARS].corr().round(3)
+print('\nPearson Correlation Matrix:')
+display(corr_matrix.style
+        .background_gradient(cmap='RdYlGn', vmin=-1, vmax=1)
+        .format('{:.3f}'))
+
+with plt.rc_context(STYLE):
+    fig, ax = plt.subplots(figsize=(8, 6.5))
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+    sns.heatmap(corr_matrix, mask=mask, annot=True, fmt='.2f',
+                cmap='RdYlGn', vmin=-1, vmax=1, square=True,
+                linewidths=0.4, ax=ax, cbar_kws={'shrink': 0.8})
+    ax.set_title('Pearson Correlation Matrix — All Variables', fontsize=12)
+    plt.tight_layout(); plt.show()
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — PRIMARY MODELING  (Bigelow + Weibull, per Run_ID)
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 3 — PRIMARY MODELING')
+print('='*70)
+
+# ── Model equations ──────────────────────────────────────────────────────────
+
+def bigelow_log10(t, kmax, logN0):
+    return logN0 - (kmax / np.log(10)) * np.asarray(t, float)
+
+def weibull_log10(t, delta, p, logN0):
+    t = np.maximum(np.asarray(t, float), 1e-12)
+    return logN0 - (t / np.maximum(delta,1e-12)) ** np.maximum(p, 1e-4)
+
+# ── Fitting functions ─────────────────────────────────────────────────────────
+
+def fit_bigelow(t, y, logN0):
+    popt, _ = curve_fit(lambda tt, k: bigelow_log10(tt, k, logN0),
+                        t, y, p0=[0.3], bounds=([1e-6],[np.inf]), maxfev=20000)
+    return ('kmax',), popt, 1
+
+def fit_weibull(t, y, logN0):
+    d0 = max(np.median(t[t>0]), 1e-2) if np.any(t>0) else 1.0
+    popt, _ = curve_fit(lambda tt, d, p: weibull_log10(tt, d, p, logN0),
+                        t, y, p0=[d0,1.0],
+                        bounds=([1e-6,1e-4],[np.inf,10.0]), maxfev=20000)
+    return ('delta','p'), popt, 2
+
+FITTERS = [
+    ('Bigelow', fit_bigelow, bigelow_log10, '-' ),
+    ('Weibull', fit_weibull, weibull_log10,  '--'),
+]
+
+# ── Fitting loop ──────────────────────────────────────────────────────────────
+results_primary = []
+run_ids = sorted(df[RUN_COL].unique())
+
+# Grid of per-run plots
+ncols = 3
+nrows = int(np.ceil(len(run_ids) / ncols))
+
+with plt.rc_context(STYLE):
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(5.5*ncols, 4.5*nrows), squeeze=False)
+    axes_flat = axes.flatten()
+
+    for ax_i, run_id in enumerate(run_ids):
+        sub    = df[df[RUN_COL]==run_id].sort_values(TIME_COL)
+        t      = sub[TIME_COL].values.astype(float)
+        y      = sub[TARGET_COL].values.astype(float)
+        logN0  = float(np.nanmax(y))
+        meta   = {f: float(sub[f].iloc[0]) for f in SEC_FACTORS}
+        n      = len(t)
+        ax     = axes_flat[ax_i]
+
+        ax.plot(t, y, 'o', color='black', ms=5, markerfacecolor='white',
+                markeredgewidth=1.2, label='Observed', zorder=6)
+
+        for name, fitter, mfunc, ls in FITTERS:
+            try:
+                pnames, popt, k = fitter(t, y, logN0)
+                y_hat = mfunc(t, *popt, logN0)
+                m = calc_metrics(y, y_hat, k)
+
+                # The line below must be indented by exactly 16 spaces
+                # relative to the start of the 'for' loop level
+                results_primary.append({
+                    RUN_COL: run_id,
+                    'Model': name,
+                    'logN0': logN0,
+                    'n': n,
+                    **meta,
+                    **dict(zip(pnames, popt)),
+                    **m
+                })
+
+                t_s = np.linspace(t.min(), t.max(), 250)
+                ax.plot(t_s, mfunc(t_s, *popt, logN0),
+                        color='black', ls=ls, lw=1.5, label=name)
+            except Exception as exc:
+                print(f'  [{run_id}] {name}: FAILED — {exc}')
+
+        ax.set_xlabel('Time ', fontsize=9)
+        ax.set_ylabel(r'$\log_{10}$ $N$', fontsize=9)
+        ax.set_title(f'Run {run_id}', fontsize=9)
+        ax.legend(fontsize=7)
+
+    # Hide unused panels
+    for j in range(len(run_ids), len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    plt.suptitle('Primary Inactivation Curves — Bigelow & Weibull',
+                 fontsize=13, y=1.01)
+    plt.tight_layout(); plt.show()
+
+# ── Tables ────────────────────────────────────────────────────────────────────
+df_primary = pd.DataFrame(results_primary).round(5)
+
+print('\nPrimary Model Parameters:')
+param_cols = [RUN_COL, 'Model', 'logN0', 'kmax', 'delta', 'p']
+display(df_primary[[c for c in param_cols if c in df_primary.columns]]
+        .reset_index(drop=True))
+
+print('\nPrimary Model Performance:')
+perf_cols  = [RUN_COL, 'Model', 'RMSE', 'R2', 'AIC', 'Bf', 'Af']
+display(df_primary[[c for c in perf_cols if c in df_primary.columns]]
+        .reset_index(drop=True))
+
+# Rank models
+df_rk = df_primary.copy()
+df_rk['Rk_RMSE']  = df_rk.groupby(RUN_COL)['RMSE'].rank(ascending=True)
+df_rk['Rk_AIC']   = df_rk.groupby(RUN_COL)['AIC'].rank(ascending=True)
+df_rk['Total_Rk'] = df_rk['Rk_RMSE'] + df_rk['Rk_AIC']
+best_counts       = (df_rk.loc[df_rk.groupby(RUN_COL)['Total_Rk'].idxmin()]
+                     ['Model'].value_counts())
+best_primary      = best_counts.idxmax()
+print(f'\nBest primary model by frequency: {best_counts.to_dict()}')
+print(f'>>> BEST PRIMARY MODEL: {best_primary} <<<')
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — SECONDARY MODELING (RSM Quadratic, 3 factors)
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 4 — SECONDARY MODELING (RSM Quadratic, 3 factors)')
+print('='*70)
+
+def build_rsm3(df_env, factors):
+    """Linear + quadratic + pairwise interactions for 3 factors."""
+    X, lbl = pd.DataFrame(index=df_env.index), {}
+    for f in factors:
+        X[f]            = df_env[f].values;         lbl[f]            = f'({f})'
+        c = f'{f}_sq';  X[c] = df_env[f].values**2; lbl[c] = f'({f})²'
+    for fi, fj in itertools.combinations(factors, 2):
+        c = f'{fi}_x_{fj}'; X[c] = df_env[fi].values * df_env[fj].values
+        lbl[c] = f'({fi}×{fj})'
+    return X, lbl
+
+
+def backward_ols(X_df, y, p_thresh=P_THRESH):
+    """Backward stepwise OLS: remove highest-p predictor until all ≤ p_thresh."""
+    rem = list(X_df.columns)
+    while rem:
+        mdl   = sm.OLS(y, sm.add_constant(X_df[rem], has_constant='add')).fit()
+        pvals = mdl.pvalues.drop('const', errors='ignore')
+        if pvals.empty or pvals.max() <= p_thresh:
+            break
+        rem.remove(pvals.idxmax())
+    Xf = (sm.add_constant(X_df[rem], has_constant='add') if rem
+          else sm.add_constant(pd.DataFrame(index=X_df.index), has_constant='add'))
+    return sm.OLS(y, Xf).fit(), rem
+
+
+# Targets: (model, column, display_name, log10_transform?)
+SEC_TARGETS = [
+    ('Bigelow', 'kmax',  'kmax_Bigelow', False),
+    ('Weibull', 'delta', 'delta_Weibull',False),
+    ('Weibull', 'p',     'p_Weibull',    False),
+]
+
+sec_results  = {}   # keyed by display_name → sm model
+sec_rows     = []
+eq_text      = []
+
+for prim_model, pcol, pdisplay, log_tf in SEC_TARGETS:
+    sub = df_primary[df_primary['Model']==prim_model].copy()
+    if sub.empty or pcol not in sub.columns:
+        print(f'  [SKIP] {pdisplay}: missing data'); continue
+    valid = sub[pcol].dropna()
+    if len(valid) < 4:
+        print(f'  [SKIP] {pdisplay}: < 4 points'); continue
+
+    y_r  = np.log10(np.maximum(valid.values.astype(float),1e-9)) if log_tf \
+           else valid.values.astype(float)
+    if np.std(y_r) < 1e-10:
+        print(f'  [SKIP] {pdisplay}: zero variance'); continue
+
+    df_e   = sub.loc[valid.index, SEC_FACTORS].reset_index(drop=True)
+    X_rsm, lbl = build_rsm3(df_e, SEC_FACTORS)
+    y_s    = pd.Series(y_r).reset_index(drop=True)
+
+    mdl, sel = backward_ols(X_rsm, y_s)
+    intercept = float(mdl.params.get('const', 0.0))
+
+    sec_results[pdisplay] = {'model': mdl, 'sel': sel, 'lbl': lbl,
+                              'log_tf': log_tf, 'df_e_ref': df_e}
+
+    # Equation string
+    eq = f'\n  {pdisplay} = {intercept:+.4f}'
+    for col in sel:
+        c = float(mdl.params[col])
+        eq += f'\n    {"+" if c>=0 else "-"} {abs(c):.4f} × {lbl.get(col,col)}'
+    eq_text.append(eq)
+
+    n_sel  = len(sel)+1
+    SS_res = float(np.sum((y_r - mdl.fittedvalues.values)**2))
+    SS_tot = float(np.sum((y_r - y_r.mean())**2))
+    adjR2  = 1-(SS_res/max(SS_tot,1e-15))*(len(y_r)-1)/max(len(y_r)-n_sel,1)
+    rmse_s = float(np.sqrt(SS_res/len(y_r)))
+
+    print(f'  {pdisplay:<20}: n_sel={len(sel)}  Adj-R²={adjR2:.3f}  RMSE={rmse_s:.4f}')
+    sec_rows.append({'Parameter': pdisplay, 'n_selected': len(sel),
+                      'Adj_R2': adjR2, 'RMSE': rmse_s, 'AIC': mdl.aic})
+
+print('\nSecondary Model Summary:')
+display(pd.DataFrame(sec_rows).round(4))
+
+print('\nSecondary Model Equations:')
+print('='*60)
+for eq in eq_text:
+    print(eq)
+print('='*60)
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+## ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — ONE-STEP GLOBAL MODELING 
+# Quadratic RSM secondary models · Factor z-score scaling · Informed p0 · Bounds
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+#
+
+print('\n' + '='*70)
+print('SECTION 5 — ONE-STEP GLOBAL MODELING')
+print('  Quadratic RSM · Factor scaling · Informed p0 · Bounds')
+print('='*70)
+
+# ── 5.1  Extract primary statistics for informed initialisation ───────────────
+#
+# Correction C3: initial intercept = mean(primary param) keeps the model
+# away from zero throughout the entire dataset on the very first evaluation.
+
+df_big_p = df_primary[df_primary['Model'] == 'Bigelow']
+df_wei_p = df_primary[df_primary['Model'] == 'Weibull']
+
+kmax_mean  = float(df_big_p['kmax'].dropna().mean())  if not df_big_p.empty else 0.30
+delta_mean = float(df_wei_p['delta'].dropna().mean()) if not df_wei_p.empty else 8.00
+p_mean     = float(df_wei_p['p'].dropna().mean())     if not df_wei_p.empty else 1.00
+
+# Safety floor: must not start at zero or negative
+kmax_mean  = max(kmax_mean,  0.01)
+delta_mean = max(delta_mean, 0.10)
+p_mean     = np.clip(p_mean, 0.10, 9.00)
+
+print(f'\n[INIT] Primary model means used for p0:')
+print(f'       kmax  = {kmax_mean:.4f}')
+print(f'       delta = {delta_mean:.4f}')
+print(f'       p     = {p_mean:.4f}')
+
+# ── 5.2  Z-score factor scaling ───────────────────────────────────────────────
+#
+# Correction C2: standardise each factor to mean=0, std=1.
+# This makes all polynomial terms (X, X², XiXj) dimensionless and
+# comparable in magnitude, preventing ill-conditioning in the Jacobian.
+# The scaling parameters are stored globally for reuse in Section 8.
+
+_KG = df['Kefir_Grains'].values.astype(float)
+_FT = df['Fermentation_Time'].values.astype(float)
+_ST = df['Storage_Temperature '].values.astype(float)
+
+SCALE = {
+    'KG': (_KG.mean(), max(_KG.std(), 1e-6)),
+    'FT': (_FT.mean(), max(_FT.std(), 1e-6)),
+    'ST': (_ST.mean(), max(_ST.std(), 1e-6)),
+}
+
+print(f'\n[SCALE] Z-score parameters (μ, σ):')
+for name_, (mu_, sd_) in SCALE.items():
+    print(f'        {name_}: μ={mu_:.4f}  σ={sd_:.4f}')
+
+def _scale(arr, key):
+    """Apply z-score scaling using stored SCALE dict."""
+    return (np.asarray(arr, float) - SCALE[key][0]) / SCALE[key][1]
+
+KGs = _scale(_KG, 'KG')
+FTs = _scale(_FT, 'FT')
+STs = _scale(_ST, 'ST')
+
+# ── 5.3  Build 11-row design matrix  X_g ─────────────────────────────────────
+#
+# Row layout:
+#   [0]  Time (h)          — kinetic variable
+#   [1]  logN0             — initial count, per run
+#   [2]  KGs               — scaled Kefir_Grains
+#   [3]  FTs               — scaled Fermentation_Time
+#   [4]  STs               — scaled Storage_Temperature
+#   [5]  KGs × FTs         — interaction
+#   [6]  KGs × STs         — interaction
+#   [7]  FTs × STs         — interaction
+#   [8]  KGs²              — quadratic
+#   [9]  FTs²              — quadratic
+#   [10] STs²              — quadratic
+
+t_g     = df[TIME_COL].values.astype(float)
+logN0_g = df['logN0'].values.astype(float)
+y_g     = df[TARGET_COL].values.astype(float)
+n_g     = len(y_g)
+
+X_g = np.vstack([
+    t_g,  logN0_g,
+    KGs,  FTs,  STs,
+    KGs*FTs,  KGs*STs,  FTs*STs,
+    KGs**2,   FTs**2,   STs**2,
+])
+print(f'\n[INFO] Global design matrix: {X_g.shape}  |  n_obs = {n_g}')
+
+# ── 5.4  Quadratic polynomial helper ─────────────────────────────────────────
+#
+# Correction C1: 10-term RSM polynomial — same structure as Section 3.
+# Terms: [β0, β_KG, β_FT, β_ST, β_KG×FT, β_KG×ST, β_FT×ST, β_KG², β_FT², β_ST²]
+
+N_Q = 10   # number of polynomial coefficients per kinetic parameter
+
+TERM_LABELS = [
+    '(intercept)',
+    'KG*', 'FT*', 'ST*',
+    'KG*×FT*', 'KG*×ST*', 'FT*×ST*',
+    'KG*²',    'FT*²',    'ST*²',
+]   # (* = standardised factor)
+
+
+def _quad10(p, start, Xg):
+    """
+    Evaluate the 10-term quadratic RSM polynomial.
+
+    Parameters
+    ----------
+    p     : full parameter array (all model coefficients)
+    start : index into p where this parameter's 10 coefficients begin
+    Xg    : (11, n_obs) design matrix
+
+    Returns
+    -------
+    1-D array of shape (n_obs,)
+    """
+    b = p[start: start + N_Q]
+    return (b[0]
+            + b[1]*Xg[2]  + b[2]*Xg[3]  + b[3]*Xg[4]    # linear
+            + b[4]*Xg[5]  + b[5]*Xg[6]  + b[6]*Xg[7]    # interactions
+            + b[7]*Xg[8]  + b[8]*Xg[9]  + b[9]*Xg[10])  # quadratic
+
+
+# ── 5.5  Global model functions ───────────────────────────────────────────────
+
+def global_bigelow_q(Xg, *p):
+    """
+    Global Bigelow — 10 free parameters.
+
+    kmax(KG,FT,ST) = quadratic RSM (Correction C1)
+    Clamp: kmax > 0  (Correction C4)
+    """
+    kmax = np.maximum(_quad10(p, 0, Xg), 1e-9)
+    return Xg[1] - (kmax / np.log(10)) * Xg[0]
+
+
+def global_weibull_q(Xg, *p):
+    """
+    Global Weibull — 20 free parameters (10 for delta + 10 for p).
+
+    delta(KG,FT,ST) = quadratic RSM,  delta > 0   (Corrections C1 + C4)
+    p(KG,FT,ST)     = quadratic RSM,  p  ∈ [0.1, 10]  (C4)
+
+    Note: p is clipped, NOT clamped with maximum(), to keep the gradient
+    well-defined at the boundary and prevent optimizer stagnation.
+    """
+    delta = np.maximum(_quad10(p,    0, Xg), 1e-9)
+    pp    = np.clip(   _quad10(p, N_Q, Xg), 0.10, 10.0)
+    return Xg[1] - (np.maximum(Xg[0], 1e-12) / delta) ** pp
+
+
+# ── 5.6  Informed starting values  (Correction C3) ───────────────────────────
+
+p0_bigelow            = np.zeros(N_Q)
+p0_bigelow[0]         = kmax_mean        # intercept = mean(kmax)
+
+p0_weibull            = np.zeros(2 * N_Q)
+p0_weibull[0]         = delta_mean       # intercept = mean(delta)
+p0_weibull[N_Q]       = p_mean          # intercept = mean(p)
+
+print(f'\n[p0]  Bigelow: β0(kmax)  = {p0_bigelow[0]:.4f}')
+print(f'[p0]  Weibull: β0(delta) = {p0_weibull[0]:.4f}')
+print(f'[p0]  Weibull: β0(p)     = {p0_weibull[N_Q]:.4f}')
+
+# ── 5.7  Bounds  (Correction C4) ─────────────────────────────────────────────
+#
+# Bounds are set in the scaled coefficient space.
+# COEF_BOUND is generous (covers all plausible quadratic surfaces);
+# only the intercepts are given tight lower bounds to prevent collapse.
+
+COEF_BOUND = 20.0
+
+# Bigelow  (10 params)
+lb_big         = np.full(N_Q,  -COEF_BOUND)
+ub_big         = np.full(N_Q,   COEF_BOUND)
+lb_big[0]      = 1e-9       # kmax intercept must be positive
+ub_big[0]      = 50.0
+
+# Weibull  (20 params)
+lb_wei         = np.full(2*N_Q, -COEF_BOUND)
+ub_wei         = np.full(2*N_Q,  COEF_BOUND)
+lb_wei[0]      = 1e-9       # delta intercept > 0
+ub_wei[0]      = 500.0
+lb_wei[N_Q]    = 0.05       # p intercept > 0.05
+ub_wei[N_Q]    = 9.00
+
+# ── 5.8  Configuration ────────────────────────────────────────────────────────
+
+GLOBAL_CFG_Q = {
+    'Global_Bigelow': {
+        'func': global_bigelow_q,
+        'k'   : N_Q,
+        'p0'  : p0_bigelow,
+        'lb'  : lb_big,
+        'ub'  : ub_big,
+    },
+    'Global_Weibull': {
+        'func': global_weibull_q,
+        'k'   : 2 * N_Q,
+        'p0'  : p0_weibull,
+        'lb'  : lb_wei,
+        'ub'  : ub_wei,
+    },
+}
+
+# ── 5.9  Fitting loop ─────────────────────────────────────────────────────────
+
+global_results  = {}
+global_eq_lines = []
+
+for gname, gcfg in GLOBAL_CFG_Q.items():
+
+    print(f'\n[FIT] {gname}  ({gcfg["k"]} parameters)...')
+
+    try:
+        popt, pcov = curve_fit(
+            gcfg['func'],
+            X_g, y_g,
+            p0      = gcfg['p0'],
+            bounds  = (gcfg['lb'], gcfg['ub']),
+            max_nfev= 500_000,
+            method  = 'trf',    # Correction C5: Trust Region Reflective,
+                                # the only method that handles bounds properly
+        )
+
+        # Convergence diagnostics
+        perr = np.sqrt(np.maximum(np.diag(pcov), 0))   # param std errors
+        y_hat = gcfg['func'](X_g, *popt)
+        m     = calc_metrics(y_g, y_hat, gcfg['k'])
+        a     = calc_apz(y_g, y_hat)
+        global_results[gname] = {
+            'y_pred': y_hat, 'popt': popt, 'perr': perr, **m, 'APZ': a
+        }
+
+        print(f'  RMSE = {m["RMSE"]:.4f}   R² = {m["R2"]:.4f}   '
+              f'AIC = {m["AIC"]:.2f}   APZ = {a:.1f}%')
+        print(f'  Bf   = {m["Bf"]:.4f}   Af = {m["Af"]:.4f}')
+
+        # ── Equation text ─────────────────────────────────────────────────────
+        global_eq_lines.append(f'\n--- {gname} ---')
+        global_eq_lines.append(
+            '  (factors are z-score standardised; * = standardised)')
+
+        if gcfg['k'] == N_Q:
+            sub_params = [('kmax', popt[:N_Q], perr[:N_Q])]
+        else:
+            sub_params = [
+                ('delta', popt[:N_Q],    perr[:N_Q]),
+                ('p',     popt[N_Q:],    perr[N_Q:]),
+            ]
+
+        for pname, coeffs, errs in sub_params:
+            lines_eq = [f'  {pname} =']
+            for i, (lbl, c, e) in enumerate(
+                    zip(TERM_LABELS, coeffs, errs)):
+                if i == 0:
+                    lines_eq.append(f'      {c:+.5f}  (±{e:.5f})')
+                else:
+                    if abs(c) < 1e-9:
+                        continue
+                    sign = '+' if c >= 0 else '-'
+                    lines_eq.append(
+                        f'      {sign} {abs(c):.5f} × {lbl}  (±{e:.5f})')
+            global_eq_lines.extend(lines_eq)
+
+    except Exception as exc:
+        print(f'  [FAIL] {gname}: {exc}')
+        global_results[gname] = {
+            'y_pred': None,
+            **{k_: np.nan for k_ in
+               ['RSS', 'RMSE', 'R2', 'AIC', 'Bf', 'Af', 'APZ']},
+        }
+
+# ── 5.10  Metrics table ───────────────────────────────────────────────────────
+
+df_gmet = pd.DataFrame([
+    {'Model': k,
+     **{mm: v[mm] for mm in ['RMSE', 'R2', 'AIC', 'Bf', 'Af']},
+     'APZ_%': v['APZ']}
+    for k, v in global_results.items()
+    if v['y_pred'] is not None
+])
+print('\nGlobal Model Metrics:')
+display(df_gmet.round(4))
+
+# ── 5.11  Equations ───────────────────────────────────────────────────────────
+
+print('\nGlobal Model Equations (Quadratic RSM — standardised factors):')
+print('='*65)
+for line in global_eq_lines:
+    print(line)
+print('='*65)
+print('\nNote: to recover predictions in original factor space, apply')
+print('  KG* = (KG − {:.3f}) / {:.3f}'.format(*SCALE['KG']))
+print('  FT* = (FT − {:.3f}) / {:.3f}'.format(*SCALE['FT']))
+print('  ST* = (ST − {:.3f}) / {:.3f}'.format(*SCALE['ST']))
+
+# ── 5.12  Parity + Residual plots ─────────────────────────────────────────────
+
+valid_g = {k: v for k, v in global_results.items() if v['y_pred'] is not None}
+
+with plt.rc_context(STYLE):
+    n_valid = max(len(valid_g), 1)
+    fig, axes = plt.subplots(2, n_valid,
+                              figsize=(5.5 * n_valid, 10.5),
+                              squeeze=False)
+
+    for i, (gname, res) in enumerate(valid_g.items()):
+        # Parity plot (row 0)
+        parity_plot(axes[0][i], y_g, res['y_pred'],
+                    gname.replace('_', ' '),
+                    k=GLOBAL_CFG_Q[gname]['k'])
+
+        # Residual plot (row 1)
+        residual_plot(axes[1][i], y_g, res['y_pred'],
+                      f'{gname.replace("_", " ")} — Residuals')
+
+    plt.suptitle(
+        'One-Step Global Model Evaluation\n'
+        'Quadratic RSM Secondary Models · Z-score Factor Scaling',
+        fontsize=13, y=1.02,
+    )
+    plt.tight_layout()
+    plt.show()
+
+# ── 5.13  Helper: build X_g from any DataFrame ─────────
+#
+# This function applies the SAME z-score scaling fitted on the training data.
+# Call it with any external DataFrame to get a compatible design matrix.
+
+def build_Xg(df_input, logN0_vals=None):
+    """
+    Build the (11, n_obs) design matrix for global models.
+
+    Parameters
+    ----------
+    df_input   : DataFrame with columns TIME_COL, Kefir_Grains,
+                 Fermentation_Time, Storage_Temperature
+    logN0_vals : optional array of per-row logN0 values.
+                 If None, uses df_input['logN0'].
+
+    Returns
+    -------
+    np.ndarray of shape (11, n_obs)
+    """
+    KGs_ = _scale(df_input['Kefir_Grains'].values,        'KG')
+    FTs_ = _scale(df_input['Fermentation_Time'].values,    'FT')
+    STs_ = _scale(df_input['Storage_Temperature '].values,  'ST')
+    t_   = df_input[TIME_COL].values.astype(float)
+    lN0_ = (logN0_vals if logN0_vals is not None
+            else df_input['logN0'].values).astype(float)
+    return np.vstack([
+        t_, lN0_,
+        KGs_, FTs_, STs_,
+        KGs_*FTs_, KGs_*STs_, FTs_*STs_,
+        KGs_**2,   FTs_**2,   STs_**2,
+    ])
+
+# Rebuild X_g via helper (sanity check — predictions must be identical)
+X_g = build_Xg(df)
+print('\n[OK] build_Xg() helper validated — X_g rebuilt correctly.')
+
+
+print('\n[SECTION 5 COMPLETE]\n')
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — MACHINE LEARNING  (RF · XGBoost · SVR, 6 features)
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 6 — MACHINE LEARNING MODELING')
+print('='*70)
+
+X_ml  = df[ML_FEATURES].values.astype(float)
+y_ml  = df[TARGET_COL].values.astype(float)
+grps  = df[RUN_COL].values
+
+# ── Group-aware train/test split ──────────────────────────────────────────────
+gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=SEED)
+tr_idx, te_idx = next(gss.split(X_ml, y_ml, grps))
+X_tr, X_te = X_ml[tr_idx], X_ml[te_idx]
+y_tr, y_te = y_ml[tr_idx], y_ml[te_idx]
+g_tr       = grps[tr_idx]
+
+n_splits = min(10, len(np.unique(g_tr)))
+cv       = GroupKFold(n_splits=n_splits)
+print(f'Train: {len(tr_idx)} obs | Test: {len(te_idx)} obs | '
+      f'GroupKFold: {n_splits} splits')
+print(f'Train Run_IDs: {np.unique(g_tr)}')
+print(f'Test  Run_IDs: {np.unique(grps[te_idx])}')
+
+# ── Random Forest ─────────────────────────────────────────────────────────────
+print('\n[RF] RandomizedSearchCV...')
+rf_cv = RandomizedSearchCV(
+    RandomForestRegressor(random_state=SEED, n_jobs=-1),
+    {'n_estimators':[100,200,300,500], 'max_depth':[None,10,20,30],
+     'min_samples_split':[2,5,10],     'min_samples_leaf':[1,2,4],
+     'max_features':['sqrt','log2',None]},
+    n_iter=60, cv=cv, scoring='neg_root_mean_squared_error',
+    refit=True, n_jobs=-1, random_state=SEED,
+).fit(X_tr, y_tr, groups=g_tr)
+best_rf    = rf_cv.best_estimator_
+y_pred_rf  = best_rf.predict(X_te)
+met_rf     = calc_metrics(y_te, y_pred_rf, k=len(ML_FEATURES))
+apz_rf     = calc_apz(y_te, y_pred_rf)
+print(f'  Best: {rf_cv.best_params_}')
+print(f'  RMSE={met_rf["RMSE"]:.4f}  R²={met_rf["R2"]:.4f}  APZ={apz_rf:.1f}%')
+
+# ── XGBoost ───────────────────────────────────────────────────────────────────
+print('\n[XGB] RandomizedSearchCV...')
+xgb_cv = RandomizedSearchCV(
+    xgb.XGBRegressor(objective='reg:squarederror', random_state=SEED,
+                     verbosity=0, n_jobs=-1),
+    {'n_estimators':[100,200,300,500], 'max_depth':[3,5,7,10],
+     'learning_rate':[0.01,0.05,0.1],  'subsample':[0.8,1.0],
+     'colsample_bytree':[0.8,1.0]},
+    n_iter=60, cv=cv, scoring='neg_root_mean_squared_error',
+    refit=True, n_jobs=-1, random_state=SEED,
+).fit(X_tr, y_tr, groups=g_tr)
+best_xgb   = xgb_cv.best_estimator_
+y_pred_xgb = best_xgb.predict(X_te)
+met_xgb    = calc_metrics(y_te, y_pred_xgb, k=len(ML_FEATURES))
+apz_xgb    = calc_apz(y_te, y_pred_xgb)
+print(f'  Best: {xgb_cv.best_params_}')
+print(f'  RMSE={met_xgb["RMSE"]:.4f}  R²={met_xgb["R2"]:.4f}  APZ={apz_xgb:.1f}%')
+
+# ── SVR ───────────────────────────────────────────────────────────────────────
+print('\n[SVR] RandomizedSearchCV...')
+svr_cv = RandomizedSearchCV(
+    Pipeline([('sc', StandardScaler()), ('svr', SVR())]),
+    {'svr__kernel':['linear','rbf'], 'svr__C':[0.1,1,10,100],
+     'svr__epsilon':[0.01,0.1,0.5],  'svr__gamma':['scale','auto']},
+    n_iter=40, cv=cv, scoring='neg_root_mean_squared_error',
+    refit=True, n_jobs=-1, random_state=SEED,
+).fit(X_tr, y_tr, groups=g_tr)
+best_svr   = svr_cv.best_estimator_
+y_pred_svr = best_svr.predict(X_te)
+met_svr    = calc_metrics(y_te, y_pred_svr, k=len(ML_FEATURES))
+apz_svr    = calc_apz(y_te, y_pred_svr)
+print(f'  Best: {svr_cv.best_params_}')
+print(f'  RMSE={met_svr["RMSE"]:.4f}  R²={met_svr["R2"]:.4f}  APZ={apz_svr:.1f}%')
+
+# ── ML performance table ──────────────────────────────────────────────────────
+ML_ITEMS = [
+    ('Random_Forest', y_pred_rf,  met_rf,  apz_rf),
+    ('XGBoost',       y_pred_xgb, met_xgb, apz_xgb),
+    ('SVR',           y_pred_svr, met_svr, apz_svr),
+]
+df_ml_perf = pd.DataFrame([
+    {'Model': n, **m, 'APZ_%': a} for n, _, m, a in ML_ITEMS
+])
+print('\nML Model Performance (Test Set):')
+display(df_ml_perf.round(4))
+
+# ── ML parity + residual plots ────────────────────────────────────────────────
+with plt.rc_context(STYLE):
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), squeeze=False)
+    for i, (name, yp, _, _) in enumerate(ML_ITEMS):
+        parity_plot(axes[0][i], y_te, yp, name.replace('_',' '),
+                    k=len(ML_FEATURES))
+        residual_plot(axes[1][i], y_te, yp, f'{name.replace("_"," ")} Residuals')
+    plt.suptitle('ML Model Evaluation — Test Set (20%)', fontsize=13, y=1.01)
+    plt.tight_layout(); plt.show()
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — COMPREHENSIVE MODEL COMPARISON
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 7 — MODEL COMPARISON')
+print('='*70)
+
+comp_rows = []
+
+# Primary (per-run average)
+for mname, g in df_primary.groupby('Model'):
+    comp_rows.append({'Model': f'Primary_{mname}', 'Category': 'Primary',
+                      'RMSE': g['RMSE'].mean(), 'R2': g['R2'].mean(),
+                      'AIC' : g['AIC'].mean(),  'Bf': g['Bf'].mean(),
+                      'Af'  : g['Af'].mean(),   'APZ_%': np.nan})
+
+# Global
+for k_, v_ in valid_g.items():
+    comp_rows.append({'Model': k_, 'Category': 'Global',
+                      **{m_: v_[m_] for m_ in ['RMSE','R2','AIC','Bf','Af']},
+                      'APZ_%': v_['APZ']})
+
+# ML
+for name, _, met, apz in ML_ITEMS:
+    comp_rows.append({'Model': name, 'Category': 'ML',
+                      **{m_: met[m_] for m_ in ['RMSE','R2','AIC','Bf','Af']},
+                      'APZ_%': apz})
+
+df_comp              = pd.DataFrame(comp_rows)
+df_comp['Rank_RMSE'] = df_comp['RMSE'].rank(ascending=True)
+df_comp['Rank_AIC']  = df_comp['AIC'].rank(ascending=True)
+df_comp['Total_Rank']= df_comp['Rank_RMSE'] + df_comp['Rank_AIC']
+df_comp              = df_comp.sort_values('Total_Rank').reset_index(drop=True)
+best_overall         = df_comp.iloc[0]['Model']
+
+print('\nAll-Model Comparison (sorted by Total Rank):')
+display(df_comp.round(4).style.highlight_min(
+    subset=['RMSE','AIC'], color='#d4edda').format(
+    {'RMSE':'{:.4f}','R2':'{:.4f}','AIC':'{:.2f}',
+     'Bf':'{:.3f}','Af':'{:.3f}','APZ_%':'{:.1f}'}))
+
+print(f'\n>>> BEST OVERALL MODEL: {best_overall} <<<')
+
+# RMSE bar chart
+with plt.rc_context(STYLE):
+    cat_col = {'Primary':'#aaaaaa','Global':'#555555','ML':'#111111'}
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    bars = ax.bar(df_comp['Model'], df_comp['RMSE'],
+                  color=[cat_col.get(c,'grey') for c in df_comp['Category']],
+                  edgecolor='black', lw=0.5)
+    ax.set_ylabel('RMSE (log$_{10}$ CFU mL$^{-1}$)')
+    ax.set_title('Comprehensive Model Comparison — RMSE', fontsize=12)
+    plt.xticks(rotation=40, ha='right', fontsize=9)
+    ax.legend(handles=[mlines.Line2D([],[],color=c,marker='s',ls='None',
+                                      ms=9,label=k)
+                        for k,c in cat_col.items()],
+              frameon=False, fontsize=9)
+    plt.tight_layout(); plt.show()
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — FEATURE IMPORTANCE
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 9 — FEATURE IMPORTANCE')
+print('='*70)
+
+feat_rows = []
+
+# ── RF MDI ───────────────────────────────────────────────────────────────────
+rf_mdi = best_rf.feature_importances_
+rf_std = np.std([t_.feature_importances_ for t_ in best_rf.estimators_], axis=0)
+for f, v, s in zip(ML_FEATURES, rf_mdi, rf_std):
+    feat_rows.append({'Feature':f,'RF_MDI':v,'RF_MDI_std':s})
+
+# ── XGB gain ─────────────────────────────────────────────────────────────────
+xgb_gain = best_xgb.feature_importances_
+df_fi = pd.DataFrame(feat_rows)
+df_fi['XGB_Gain'] = xgb_gain
+
+# ── Permutation (test set) ────────────────────────────────────────────────────
+perm_rf  = permutation_importance(best_rf,  X_te, y_te, n_repeats=30,
+                                   random_state=SEED, n_jobs=-1)
+perm_xgb = permutation_importance(best_xgb, X_te, y_te, n_repeats=30,
+                                   random_state=SEED, n_jobs=-1)
+perm_svr = permutation_importance(best_svr, X_te, y_te, n_repeats=30,
+                                   random_state=SEED, n_jobs=-1)
+df_fi['Perm_RF']  = perm_rf.importances_mean
+df_fi['Perm_XGB'] = perm_xgb.importances_mean
+df_fi['Perm_SVR'] = perm_svr.importances_mean
+
+df_fi = df_fi.sort_values('RF_MDI', ascending=False).reset_index(drop=True)
+print('\nFeature Importance Summary:')
+display(df_fi.round(4))
+
+# ── Bar plots ─────────────────────────────────────────────────────────────────
+with plt.rc_context(STYLE):
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), squeeze=False)
+
+    # RF MDI
+    sorted_idx = np.argsort(rf_mdi)
+    axes[0][0].barh(np.array(ML_FEATURES)[sorted_idx], rf_mdi[sorted_idx],
+                    xerr=rf_std[sorted_idx], color='grey', edgecolor='black', lw=0.4,
+                    error_kw={'elinewidth':0.7,'capsize':3})
+    axes[0][0].set_xlabel('Mean Decrease in Impurity')
+    axes[0][0].set_title('Random Forest (MDI)', fontsize=10)
+
+    # XGB Gain
+    sorted_idx2 = np.argsort(xgb_gain)
+    axes[0][1].barh(np.array(ML_FEATURES)[sorted_idx2], xgb_gain[sorted_idx2],
+                    color='grey', edgecolor='black', lw=0.4)
+    axes[0][1].set_xlabel('Gain-based Importance')
+    axes[0][1].set_title('XGBoost (Gain)', fontsize=10)
+
+    # Permutation (all 3)
+    x_pos = np.arange(len(ML_FEATURES))
+    w     = 0.25
+    axes[0][2].barh(x_pos+w, perm_rf.importances_mean, w, color='#222',
+                    label='RF', edgecolor='black', lw=0.3)
+    axes[0][2].barh(x_pos,   perm_xgb.importances_mean, w, color='#888',
+                    label='XGB', edgecolor='black', lw=0.3)
+    axes[0][2].barh(x_pos-w, perm_svr.importances_mean, w, color='#ccc',
+                    label='SVR', edgecolor='black', lw=0.3)
+    axes[0][2].set_yticks(x_pos); axes[0][2].set_yticklabels(ML_FEATURES)
+    axes[0][2].axvline(0, color='black', lw=0.6)
+    axes[0][2].set_xlabel('Mean decrease in R²')
+    axes[0][2].set_title('Permutation Importance', fontsize=10)
+    axes[0][2].legend(fontsize=8)
+
+    plt.suptitle('Feature Importance Analysis', fontsize=13, y=1.01)
+    plt.tight_layout(); plt.show()
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 — SHAP EXPLAINABILITY
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 10 — SHAP EXPLAINABILITY')
+print('='*70)
+
+shap_summary_rows = []
+SHAP_MODELS = {'RF': best_rf, 'XGB': best_xgb}
+
+for sname, smodel in SHAP_MODELS.items():
+    print(f'\n  [SHAP] Computing for {sname}...')
+    try:
+        explainer  = shap.TreeExplainer(smodel)
+        sv_raw     = explainer.shap_values(X_tr)
+        shap_vals  = (sv_raw.values if hasattr(sv_raw,'values')
+                      else np.array(sv_raw))
+        if shap_vals.ndim == 3:
+            shap_vals = shap_vals[0]
+
+        # ── Beeswarm summary ──────────────────────────────────────────────────
+        print(f'  [{sname}] Beeswarm Summary Plot:')
+        plt.figure(figsize=(7, 5))
+        shap.summary_plot(shap_vals, X_tr, feature_names=ML_FEATURES,
+                           show=False, plot_size=None)
+        plt.title(f'{sname} — SHAP Beeswarm Summary', fontsize=12)
+        plt.tight_layout(); plt.show()
+
+        # ── Bar plot ──────────────────────────────────────────────────────────
+        print(f'  [{sname}] Mean |SHAP| Bar Plot:')
+        plt.figure(figsize=(6.5, 4.5))
+        shap.summary_plot(shap_vals, X_tr, feature_names=ML_FEATURES,
+                           plot_type='bar', show=False, plot_size=None)
+        plt.title(f'{sname} — Mean |SHAP| Bar', fontsize=12)
+        plt.tight_layout(); plt.show()
+
+        # ── Dependence plots (all 6 features in a grid) ───────────────────────
+        print(f'  [{sname}] Dependence Plots:')
+        with plt.rc_context(STYLE):
+            fig, axes = plt.subplots(2, 3, figsize=(17, 10), squeeze=False)
+            axes_flat = axes.flatten()
+            for fi, fname_f in enumerate(ML_FEATURES):
+                shap.dependence_plot(fi, shap_vals, X_tr,
+                                     feature_names=ML_FEATURES,
+                                     ax=axes_flat[fi], show=False)
+                axes_flat[fi].set_title(f'{fname_f}', fontsize=9)
+            plt.suptitle(
+                f'{sname} — SHAP Dependence Plots\n'
+                'Nonlinear feature interactions and contributions to'
+                r' $\log_{10}$ $N$ prediction',
+                fontsize=11, y=1.02)
+            plt.tight_layout(); plt.show()
+
+        # Mean |SHAP|
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        for fn, val in zip(ML_FEATURES, mean_abs):
+            shap_summary_rows.append({'Model': sname, 'Feature': fn,
+                                       'Mean_Abs_SHAP': round(val, 5)})
+        print(f'  [{sname}] Done.')
+
+    except Exception as exc:
+        print(f'  [WARN] SHAP {sname}: {exc}')
+
+df_shap = pd.DataFrame(shap_summary_rows)
+print('\nSHAP Summary — Mean |SHAP| values:')
+display(df_shap.pivot(index='Feature', columns='Model',
+                       values='Mean_Abs_SHAP').round(4))
+
+# ==============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11 — FINAL SCIENTIFIC SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+# ==============================================================================
+print('\n' + '='*70)
+print('SECTION 11 — FINAL SCIENTIFIC SUMMARY')
+print('='*70)
+
+# Best primary
+print(f'\n  Best Primary Model   : {best_primary}')
+
+# Best global
+if not df_gmet.empty:
+    best_global = df_gmet.sort_values('RMSE').iloc[0]['Model']
+    best_global_metrics = df_gmet.sort_values('RMSE').iloc[0]
+    print(f'  Best Global Model    : {best_global}')
+    print(f'    RMSE={best_global_metrics["RMSE"]:.4f}  '
+          f'R²={best_global_metrics["R2"]:.4f}  '
+          f'APZ={best_global_metrics["APZ_%"]:.1f}%')
+
+# Best ML
+df_ml_sorted = df_ml_perf.sort_values('RMSE')
+best_ml = df_ml_sorted.iloc[0]['Model']
+print(f'  Best ML Model        : {best_ml}')
+print(f'    RMSE={df_ml_sorted.iloc[0]["RMSE"]:.4f}  '
+      f'R²={df_ml_sorted.iloc[0]["R2"]:.4f}  '
+      f'APZ={df_ml_sorted.iloc[0]["APZ_%"]:.1f}%')
+
+# Best overall
+print(f'\n  Best Overall Model   : {best_overall}')
+best_row = df_comp.iloc[0]
+print(f'    RMSE={best_row["RMSE"]:.4f}  '
+      f'R²={best_row["R2"]:.4f}  '
+      f'AIC={best_row["AIC"]:.2f}  '
+      f'APZ={best_row["APZ_%"]:.1f}%')
+
+# Most influential variables (consensus across RF, XGB, SHAP)
+print('\n  Most Influential Variables:')
+print(f'    RF MDI (top-3)  : {df_fi.sort_values("RF_MDI", ascending=False)["Feature"].head(3).tolist()}')
+print(f'    XGB Gain (top-3): {df_fi.sort_values("XGB_Gain", ascending=False)["Feature"].head(3).tolist()}')
+if not df_shap.empty:
+    shap_rank = (df_shap.groupby('Feature')['Mean_Abs_SHAP'].mean()
+                 .sort_values(ascending=False))
+    print(f'    SHAP (top-3)    : {shap_rank.head(3).index.tolist()}')
+
+print('\n' + '='*70)
+print('PIPELINE COMPLETE')
+print('='*70)
